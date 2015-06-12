@@ -5,8 +5,10 @@
  */
 var _ = require('lodash'),
     errorHandler = require('../errors.server.controller'),
+    github = require('octonode'),
     mongoose = require('mongoose'),
     passport = require('passport'),
+    Promise = require('bluebird'),
     User = mongoose.model('User');
 
 /**
@@ -18,13 +20,12 @@ exports.signup = function(req, res) {
 
     // Init Variables
     var user = new User(req.body);
-    var message = null;
 
     // Add missing user fields
     user.provider = 'local';
     user.displayName = user.firstName + ' ' + user.lastName;
 
-    // Then save the user 
+    // Then save the user
     user.save(function(err) {
         if (err) {
             return res.status(400).send({
@@ -97,11 +98,38 @@ exports.oauthCallback = function(strategy) {
     };
 };
 
+function createUserCallback(err, user, providerUserProfile, organizations, callback) {
+    if (!user) {
+        var possibleUsername = providerUserProfile.username || ((providerUserProfile.email) ? providerUserProfile.email.split('@')[0] : '');
+
+        User.findUniqueUsername(possibleUsername, null, function(availableUsername) {
+            user = new User({
+                firstName: providerUserProfile.firstName,
+                lastName: providerUserProfile.lastName,
+                username: availableUsername,
+                displayName: providerUserProfile.displayName,
+                email: providerUserProfile.email,
+                provider: providerUserProfile.provider,
+                providerData: providerUserProfile.providerData,
+                organizations: organizations || []
+            });
+
+            // And save the user
+            user.save(function(err) {
+                return callback(err, user);
+            });
+        });
+    } else {
+        return callback(err, user);
+    }
+};
+
 /**
- * Helper function to save or update a OAuth user profile
+* Helper function to save or update a OAuth user profile
  */
 exports.saveOAuthUserProfile = function(req, providerUserProfile, done) {
     if (!req.user) {
+
         // Define a search query fields
         var searchMainProviderIdentifierField = 'providerData.' + providerUserProfile.providerIdentifierField;
         var searchAdditionalProviderIdentifierField = 'additionalProvidersData.' + providerUserProfile.provider + '.' + providerUserProfile.providerIdentifierField;
@@ -124,27 +152,17 @@ exports.saveOAuthUserProfile = function(req, providerUserProfile, done) {
             if (err) {
                 return done(err);
             } else {
-                if (!user) {
-                    var possibleUsername = providerUserProfile.username || ((providerUserProfile.email) ? providerUserProfile.email.split('@')[0] : '');
-
-                    User.findUniqueUsername(possibleUsername, null, function(availableUsername) {
-                        user = new User({
-                            firstName: providerUserProfile.firstName,
-                            lastName: providerUserProfile.lastName,
-                            username: availableUsername,
-                            displayName: providerUserProfile.displayName,
-                            email: providerUserProfile.email,
-                            provider: providerUserProfile.provider,
-                            providerData: providerUserProfile.providerData
-                        });
-
-                        // And save the user
-                        user.save(function(err) {
-                            return done(err, user);
-                        });
-                    });
+                // If the provider is Github, we must also fetch the user's organizations
+                if(providerUserProfile.provider === 'github') {
+                    var accessToken = providerUserProfile.providerData.accessToken;
+                    var client = github.client(accessToken);
+                    var ghme = client.me();
+                    Promise.promisifyAll(ghme);
+                    ghme.orgsAsync().then(function(orgs){
+                        return createUserCallback(err, user, providerUserProfile, orgs[0], done);
+                    }).catch(console.error);
                 } else {
-                    return done(err, user);
+                    return createUserCallback(err, user, providerUserProfile, null, done);
                 }
             }
         });
